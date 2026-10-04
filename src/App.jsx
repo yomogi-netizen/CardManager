@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { supabase } from "./supabase";
+// クラウド(Supabase)は使用しません。データはこの端末の中だけに保存されます。
+const supabase = null;
 
 /* =========================================================
     カード管理 (Web版)
@@ -377,6 +378,20 @@ const saveSnapshot = (scope, data) =>
   idb("snapshots", "readwrite", (s) => s.put({ scope, ...data, saved_at: Date.now() })).catch((e) =>
     console.error("ローカル保存エラー:", e)
   );
+// 旧バージョン(ログイン版)でこの端末に保存されていたデータを探す
+const MIGRATED_KEY = "card-app.migratedFromAccount";
+const findAccountSnapshot = () =>
+  idb("snapshots", "readonly", (s) => s.getAll())
+    .then((all) =>
+      (all || [])
+        .filter(
+          (x) =>
+            String(x.scope).startsWith("user:") &&
+            ((x.cards || []).length > 0 || (x.titleInfos || []).length > 0)
+        )
+        .sort((a, b) => (b.saved_at || 0) - (a.saved_at || 0))[0] || null
+    )
+    .catch(() => null);
 const queueAll = () =>
   idb("sync_queue", "readonly", (s) => s.getAll()).then((r) => r || []).catch(() => []);
 const queueDelete = (id) => idb("sync_queue", "readwrite", (s) => s.delete(id));
@@ -729,93 +744,6 @@ function ColorField({ value, onChange, label }) {
    6. 各モーダル
    --------------------------------------------------------- */
 
-// ---- ログイン / 新規登録 ----
-function LoginModal({ onClose, onNotice }) {
-  const [mode, setMode] = useState("login");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setError("");
-    if (!email.trim() || !password) {
-      setError("メールアドレスとパスワードを入力してください");
-      return;
-    }
-    setBusy(true);
-    try {
-      if (mode === "login") {
-        const { error: err } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-        if (err) throw err;
-        onClose();
-      } else {
-        if (password.length < 6) throw new Error("パスワードは6文字以上にしてください");
-        const { data, error: err } = await supabase.auth.signUp({ email: email.trim(), password });
-        if (err) throw err;
-        if (data.session) {
-          onClose();
-        } else {
-          onNotice("確認メールを送信しました。メール内のリンクを開いてからログインしてください");
-          setMode("login");
-        }
-      }
-    } catch (err) {
-      setError(
-        /invalid login/i.test(err.message)
-          ? "メールアドレスまたはパスワードが正しくありません"
-          : err.message || "ログインに失敗しました"
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal title={mode === "login" ? "ログイン" : "新規登録"} onClose={onClose} size="sm">
-      <form className="stack" onSubmit={submit}>
-        <p className="hint">
-          ログインすると、カード情報がクラウドに保存され、複数の端末で共有できます。
-        </p>
-        <Field label="メールアドレス">
-          <input
-            type="email"
-            autoComplete="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            autoFocus
-          />
-        </Field>
-        <Field label="パスワード">
-          <input
-            type="password"
-            autoComplete={mode === "login" ? "current-password" : "new-password"}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
-        {error && <div className="error">{error}</div>}
-        <button type="submit" className="primary" disabled={busy}>
-          {busy ? "処理中…" : mode === "login" ? "ログイン" : "登録する"}
-        </button>
-        <button
-          type="button"
-          className="link center"
-          onClick={() => {
-            setMode(mode === "login" ? "signup" : "login");
-            setError("");
-          }}
-        >
-          {mode === "login" ? "アカウントを作成する" : "ログインに戻る"}
-        </button>
-      </form>
-    </Modal>
-  );
-}
 
 // ---- カード追加 / 編集フォーム ----
 function CardForm({
@@ -1769,7 +1697,8 @@ function BackgroundSettings({ bg, onChange, onNotice }) {
 }
 
 // ---- 設定 (Swift版 ImageCacheSettingsView + 同期状態) ----
-function SettingsModal({ session, pending, syncError, online, bg, onBgChange, onSyncNow, onReload, onClose, onNotice }) {
+function SettingsModal({ online, bg, onBgChange, onExport, onImport, onClose, onNotice }) {
+  const fileRef = useRef(null);
   const [size, setSize] = useState(null);
   const refresh = useCallback(() => imageCache.size().then(setSize), []);
   useEffect(() => {
@@ -1804,37 +1733,38 @@ function SettingsModal({ session, pending, syncError, online, bg, onBgChange, on
         </section>
 
         <section className="group-box">
-          <h3>データの保存先</h3>
+          <h3>データの保存先とバックアップ</h3>
           <div className="kv">
-            <span>アカウント</span>
-            <span>{session ? session.user.email : "ゲスト（この端末のみ）"}</span>
+            <span>保存先</span>
+            <span>この端末のみ（外部には送信しません）</span>
           </div>
           <div className="kv">
             <span>通信状態</span>
             <span>{online ? "オンライン" : "オフライン"}</span>
           </div>
-          {session && (
-            <>
-              <div className="kv">
-                <span>未同期の変更</span>
-                <span>{pending}件</span>
-              </div>
-              {syncError && <div className="error">{syncError}</div>}
-              <div className="row2">
-                <button type="button" className="secondary" onClick={onSyncNow} disabled={!online || pending === 0}>
-                  今すぐ同期
-                </button>
-                <button type="button" className="secondary" onClick={onReload} disabled={!online}>
-                  クラウドから再読み込み
-                </button>
-              </div>
-            </>
-          )}
-          {!session && (
-            <p className="hint">
-              ゲストのデータはこのブラウザ内にだけ保存されます。ログインするとクラウドに保存し、他の端末と共有できます。
-            </p>
-          )}
+          <div className="row2">
+            <button type="button" className="secondary" onClick={onExport}>
+              バックアップを保存
+            </button>
+            <button type="button" className="secondary" onClick={() => fileRef.current?.click()}>
+              バックアップから復元
+            </button>
+          </div>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) onImport(f);
+            }}
+          />
+          <p className="hint">
+            データはこのブラウザ内にだけ保存され、アカウントやサーバーは使いません。ブラウザのデータを消す・端末を替える場合に備えて、
+            定期的にバックアップを保存してください。機種変更はバックアップを復元すれば引き継げます。
+          </p>
         </section>
       </div>
     </Modal>
@@ -2226,7 +2156,6 @@ export default function App() {
   const [colorTitleId, setColorTitleId] = useState(null);
   const [viewer, setViewer] = useState(null); // { cardId, index }
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [loginOpen, setLoginOpen] = useState(false);
 
   const showNotice = useCallback((text, tone = "info") => {
     setNotice({ text, tone });
@@ -2407,6 +2336,26 @@ export default function App() {
 
     // ゲスト：この端末のデータだけ
     if (!id) {
+      // 旧バージョンのアカウントデータが端末に残っていれば、一度だけ引き継ぐ
+      let migrated = false;
+      try {
+        migrated = localStorage.getItem(MIGRATED_KEY) === "1";
+      } catch {
+        /* ignore */
+      }
+      if (!migrated && localCards.length === 0) {
+        const old = await findAccountSnapshot();
+        try {
+          localStorage.setItem(MIGRATED_KEY, "1");
+        } catch {
+          /* ignore */
+        }
+        if (old) {
+          localCards = (old.cards || []).map(normalizeCard);
+          localTitles = (old.titleInfos || []).map(normalizeTitle);
+          showNotice(`以前のデータを引き継ぎました（カード${localCards.length}枚）`);
+        }
+      }
       apply(localCards, localTitles.length > 0 ? localTitles : makeDefaultTitles());
       setLoading(false);
       return;
@@ -2490,19 +2439,9 @@ export default function App() {
   /* ---------- 副作用 ---------- */
 
   useEffect(() => {
-    let alive = true;
-    supabase.auth.getSession().then(({ data }) => {
-      if (!alive) return;
-      setSession(data.session);
-      setAuthReady(true);
-    });
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
-    return () => {
-      alive = false;
-      subscription.unsubscribe();
-    };
+    setAuthReady(true);
+    // ブラウザによるデータの自動削除を防ぐ(対応ブラウザのみ)
+    navigator.storage?.persist?.().catch(() => {});
   }, []);
 
   // ログイン状態が変わったら、そのスコープのデータを読み込む
@@ -2690,14 +2629,44 @@ export default function App() {
     );
   };
 
-  const logout = async () => {
-    const msg =
-      pending > 0
-        ? `未同期の変更が${pending}件あります。次回ログインしたときに同期されます。ログアウトしますか？`
-        : "ログアウトしますか？";
-    if (!window.confirm(msg)) return;
-    const { error } = await supabase.auth.signOut();
-    if (error) await supabase.auth.signOut({ scope: "local" });
+  // ---- バックアップ (JSONファイル) ----
+  const exportBackup = () => {
+    const data = {
+      app: "card-manager",
+      version: 1,
+      exported_at: new Date().toISOString(),
+      cards: cardsRef.current,
+      titleInfos: titlesRef.current,
+    };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `card-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showNotice("バックアップを保存しました");
+  };
+
+  const importBackup = async (file) => {
+    try {
+      const data = JSON.parse(await file.text());
+      if (!Array.isArray(data.cards) || !Array.isArray(data.titleInfos)) throw new Error("形式が違います");
+      if (
+        !window.confirm(
+          `現在のデータを、バックアップ（カード${data.cards.length}枚・タイトル${data.titleInfos.length}件）で置き換えます。よろしいですか？`
+        )
+      )
+        return;
+      commitCards(data.cards.map(normalizeCard));
+      commitTitles(data.titleInfos.map(normalizeTitle));
+      showNotice("バックアップから復元しました");
+    } catch (e) {
+      console.error(e);
+      showNotice("読み込めないファイルです", "error");
+    }
   };
 
   const detailCard = cards.find((c) => c.id === detailId) || null;
@@ -2729,11 +2698,7 @@ export default function App() {
         <div className="topbar-title">
           <h1>{navTitle}</h1>
           <p>
-            <span>{session ? "ログイン中" : "ゲストモード"}</span>
-            {" · "}
-            <button type="button" className="topbar-action" onClick={session ? logout : () => setLoginOpen(true)}>
-              {session ? "ログアウト" : "ログイン"}
-            </button>
+            <span>この端末に保存</span>
           </p>
         </div>
         {session && (pending > 0 || syncError || !online) && (
@@ -2854,7 +2819,7 @@ export default function App() {
         </div>
 
         {loading && dataScope !== scope ? (
-          <div className="empty">クラウドデータを読み込み中…</div>
+          <div className="empty">データを読み込み中…</div>
         ) : sorted.length === 0 ? (
           <div className="empty">
             <div className="empty-mark">♢</div>
@@ -3014,20 +2979,16 @@ export default function App() {
 
       {settingsOpen && (
         <SettingsModal
-          session={session}
-          pending={pending}
-          syncError={syncError}
           online={online}
           bg={appBg}
           onBgChange={setAppBg}
-          onSyncNow={flushQueue}
-          onReload={loadData}
+          onExport={exportBackup}
+          onImport={importBackup}
           onClose={() => setSettingsOpen(false)}
           onNotice={showNotice}
         />
       )}
 
-      {loginOpen && !session && <LoginModal onClose={() => setLoginOpen(false)} onNotice={showNotice} />}
     </div>
   );
 }
